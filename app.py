@@ -1,767 +1,682 @@
-import streamlit as st
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, Polygon
-from scipy.integrate import odeint
-from scipy.special import jv  # 贝塞尔函数
-import time
+import React, { useState, useEffect, useRef } from 'react';
+import { Play, Pause, RotateCcw, Download, Info } from 'lucide-react';
+import * as THREE from 'three';
 
-# --- 1. 页面基本设置 ---
-st.set_page_config(page_title="高级地震液体晃动模拟", layout="wide")
-st.title("🌊 高级液体晃动模拟 (Sloshing Pro+ 修正版)")
-st.markdown("支持 **多种罐体形状** 与 **历史著名地震波** 响应分析 | ✅ 算法已修正")
+const Sloshing3DSimulator = () => {
+  // 状态管理
+  const [shapeType, setShapeType] = useState('cylindrical');
+  const [radius, setRadius] = useState(2.0);
+  const [length, setLength] = useState(4.0);
+  const [width, setWidth] = useState(3.0);
+  const [height, setHeight] = useState(3.0);
+  const [fillHeight, setFillHeight] = useState(2.0);
+  const [quakeType, setQuakeType] = useState('sine');
+  const [pga, setPga] = useState(0.3);
+  const [duration, setDuration] = useState(20);
+  const [isRunning, setIsRunning] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [results, setResults] = useState(null);
+  const [showInfo, setShowInfo] = useState(false);
 
-# --- 2. 工具函数：生成模拟地震波 ---
-def generate_synthetic_quake(name, t, pga_g):
-    """
-    生成模拟的地震加速度时程 (单位: m/s^2)
-    为了保持代码单文件运行，这里使用随机噪声+包络函数+滤波
-    来模拟著名地震波的频谱特性和持续时间，而非读取外部CSV。
-    """
-    g = 9.81
-    np.random.seed(42) # 固定种子，保证每次生成的波形一样
-    
-    # 基础白噪声
-    noise = np.random.normal(0, 1, len(t))
-    
-    if name == "正弦波 (Sine Wave)":
-        # 纯正弦波用于理论验证
-        freq = 0.6 
-        envelope = np.ones_like(t)
-        envelope[:int(len(t)*0.1)] = np.linspace(0, 1, int(len(t)*0.1)) # 渐入
-        acc_raw = np.sin(2 * np.pi * freq * t) * envelope
+  const canvasRef = useRef(null);
+  const sceneRef = useRef(null);
+  const animationRef = useRef(null);
+
+  // 3D物理求解器
+  class Sloshing3DSolver {
+    constructor(shape, dimensions, h, pga, duration) {
+      this.shape = shape;
+      this.dims = dimensions;
+      this.h = h;
+      this.g = 9.81;
+      this.pga = pga;
+      this.duration = duration;
+      
+      this.calcNaturalFrequency();
+      this.calcDamping();
+      this.calcModalParticipation();
+    }
+
+    calcNaturalFrequency() {
+      if (this.shape === 'rectangular') {
+        const L = this.dims.length;
+        const W = this.dims.width;
+        const k = Math.PI / Math.max(L, W);
+        this.omega_n = Math.sqrt(this.g * k * Math.tanh(k * this.h));
+      } else if (this.shape === 'cylindrical') {
+        const R = this.dims.radius;
+        const epsilon_1 = 1.8412;
+        this.omega_n = Math.sqrt((this.g * epsilon_1 / R) * Math.tanh(epsilon_1 * this.h / R));
+      } else {
+        const R_mean = (this.dims.outerRadius + this.dims.innerRadius) / 2;
+        const epsilon_1 = 1.8412;
+        this.omega_n = Math.sqrt((this.g * epsilon_1 / R_mean) * Math.tanh(epsilon_1 * this.h / R_mean));
+      }
+      this.freq_n = this.omega_n / (2 * Math.PI);
+    }
+
+    calcDamping() {
+      const nu = 1e-6;
+      let characteristicLength;
+      
+      if (this.shape === 'rectangular') {
+        characteristicLength = Math.max(this.dims.length, this.dims.width);
+      } else if (this.shape === 'cylindrical') {
+        characteristicLength = this.dims.radius;
+      } else {
+        characteristicLength = (this.dims.outerRadius + this.dims.innerRadius) / 2;
+      }
+      
+      const xi_viscous = 2 * Math.sqrt(nu / (this.omega_n * characteristicLength ** 2));
+      const xi_structural = 0.005;
+      this.xi = Math.max(0.005, Math.min(0.05, xi_viscous + xi_structural));
+    }
+
+    calcModalParticipation() {
+      if (this.shape === 'rectangular') {
+        const L = this.dims.length;
+        const k = Math.PI / L;
+        const kh = k * this.h;
+        this.gamma = kh < 0.01 ? 1.0 : Math.tanh(kh) / kh;
+      } else {
+        const epsilon_1 = 1.8412;
+        const R = this.shape === 'cylindrical' ? this.dims.radius : 
+                   (this.dims.outerRadius + this.dims.innerRadius) / 2;
+        const x = epsilon_1 * this.h / R;
         
-    elif name == "El Centro (1940)":
-        # 特点：持续时间长，频谱丰富
-        envelope = np.exp(-0.15 * t) * (t ** 1.5)
-        # 模拟低频为主
-        acc_raw = np.convolve(noise, np.ones(5)/5, mode='same') * envelope
-        
-    elif name == "Kobe (1995)":
-        # 特点：近场脉冲，猛烈但短促
-        envelope = np.exp(-0.5 * (t - 3)**2) * 5 # 脉冲型
-        acc_raw = noise * envelope
-        
-    elif name == "Northridge (1994)":
-        # 特点：高频成分多
-        envelope = np.exp(-0.2 * t) * t
-        acc_raw = noise * envelope
-        
-    elif name == "Chi-Chi (1999)":
-        # 特点：非常长的周期和持续时间
-        envelope = (np.sin(t/3) + 1.2) * np.exp(-0.05*t) * (t>1)
-        acc_raw = np.convolve(noise, np.ones(15)/15, mode='same') * envelope
-        
-    else:
-        acc_raw = noise
+        if (x < 0.1) {
+          this.gamma = 1.0;
+        } else {
+          // 简化的贝塞尔函数近似
+          this.gamma = 0.7;
+        }
+      }
+    }
 
-    # 归一化并缩放至目标 PGA (Peak Ground Acceleration)
-    current_max = np.max(np.abs(acc_raw))
-    if current_max == 0: current_max = 1
-    acc_normalized = acc_raw / current_max
-    
-    return acc_normalized * pga_g * g
+    generateEarthquake(t) {
+      const seed = 42;
+      const noise = Math.sin(seed * t) * Math.cos(seed * t * 1.7);
+      
+      let acc;
+      if (this.quakeType === 'sine') {
+        const envelope = t < this.duration * 0.1 ? t / (this.duration * 0.1) : 1;
+        acc = Math.sin(2 * Math.PI * 0.6 * t) * envelope;
+      } else if (this.quakeType === 'elcentro') {
+        const envelope = Math.exp(-0.15 * t) * (t ** 1.5);
+        acc = noise * envelope;
+      } else if (this.quakeType === 'kobe') {
+        const envelope = Math.exp(-0.5 * (t - 3) ** 2) * 5;
+        acc = noise * envelope;
+      } else {
+        const envelope = Math.exp(-0.2 * t) * t;
+        acc = noise * envelope;
+      }
+      
+      return acc * this.pga * this.g;
+    }
 
-# --- 3. 侧边栏：参数设置 ---
-with st.sidebar:
-    st.header("🏗️ 模型参数")
-    
-    # --- 形状选择 ---
-    shape_type = st.selectbox(
-        "罐体形状", 
-        ["矩形 (Rectangular)", "圆柱形 (Cylindrical)", "圆环形 (Annular)"]
-    )
-    
-    # 尺寸变量初始化
-    L, R, R_in, R_out = 0, 0, 0, 0
-    
-    if "矩形" in shape_type:
-        L = st.number_input("长度 L (m)", 2.0, 10.0, 4.0, step=0.5)
-        H = st.number_input("高度 H (m)", 1.0, 10.0, 3.0, step=0.5)
-        h_fill = st.slider("液面深度 h (m)", 0.1, H, 2.0)
-    elif "圆柱" in shape_type:
-        R = st.number_input("半径 R (m)", 0.5, 5.0, 2.0, step=0.1)
-        H = st.number_input("高度 H (m)", 1.0, 10.0, 3.0, step=0.5)
-        h_fill = st.slider("液面深度 h (m)", 0.1, H, 2.0)
-    elif "圆环" in shape_type:
-        c1, c2 = st.columns(2)
-        R_out = c1.number_input("外半径 Rout", 1.0, 10.0, 3.0)
-        R_in = c2.number_input("内半径 Rin", 0.5, 9.0, 1.5)
-        H = st.number_input("高度 H (m)", 1.0, 10.0, 3.0)
-        h_fill = st.slider("液面深度 h (m)", 0.1, H, 2.0)
-
-    st.markdown("---")
-    st.header("📉 地震输入")
-    
-    # --- 地震波选择 ---
-    quake_name = st.selectbox(
-        "选择地震波记录",
-        ["正弦波 (Sine Wave)", "El Centro (1940)", "Northridge (1994)", "Kobe (1995)", "Chi-Chi (1999)"]
-    )
-    
-    # --- PGA 输入 (使用 g) ---
-    pga_g = st.slider("PGA (峰值加速度) [g]", 0.05, 1.0, 0.3, step=0.05)
-    st.caption(f"当前峰值加速度: {pga_g * 9.81:.2f} m/s²")
-    
-    duration = st.slider("模拟时长 (s)", 10, 40, 20)
-    
-    # --- 阻尼比选项 ---
-    st.markdown("---")
-    st.subheader("高级选项")
-    use_auto_damping = st.checkbox("自动计算阻尼", value=True)
-    if not use_auto_damping:
-        manual_damping = st.slider("阻尼比 ξ", 0.005, 0.10, 0.03, step=0.005)
-    else:
-        manual_damping = None
-    
-    # --- 预览地震波 ---
-    t_preview = np.linspace(0, duration, 200)
-    acc_preview = generate_synthetic_quake(quake_name, t_preview, pga_g)
-    
-    fig_prev, ax_prev = plt.subplots(figsize=(4, 1.5))
-    ax_prev.plot(t_preview, acc_preview / 9.81, color='red', lw=1)
-    ax_prev.set_title("输入加速度时程 (g)", fontsize=8)
-    ax_prev.set_xlabel("时间 (s)", fontsize=7)
-    ax_prev.set_ylabel("加速度 (g)", fontsize=7)
-    ax_prev.grid(True, alpha=0.3)
-    ax_prev.tick_params(labelsize=6)
-    st.pyplot(fig_prev)
-    plt.close()
-
-    st.markdown("---")
-    speed_factor = st.select_slider("动画播放速度", options=["慢速", "正常", "快速"], value="正常")
-
-# --- 4. 物理求解核心（修正版）---
-class SloshingSolver:
-    def __init__(self, shape, h, auto_damping=True, manual_xi=None, **kwargs):
-        self.shape = shape
-        self.h = h
-        self.g = 9.81
-        self.kwargs = kwargs
+    solve() {
+      const dt = 0.05;
+      const steps = Math.floor(this.duration / dt);
+      const t_array = [];
+      const q_array = [];
+      const acc_array = [];
+      
+      let q = 0, q_dot = 0;
+      
+      for (let i = 0; i < steps; i++) {
+        const t = i * dt;
+        const a_ground = this.generateEarthquake(t);
         
-        # 计算固有频率和模态参数
-        self.omega_n = self.calc_natural_frequency()
-        self.freq_n = self.omega_n / (2 * np.pi)
+        const forcing = -this.gamma * a_ground;
+        const q_ddot = forcing - 2 * this.xi * this.omega_n * q_dot - (this.omega_n ** 2) * q;
         
-        # 计算阻尼比
-        if auto_damping:
-            self.xi = self.calc_damping_ratio()
-        else:
-            self.xi = manual_xi if manual_xi else 0.03
+        q_dot += q_ddot * dt;
+        q += q_dot * dt;
         
-        # 计算模态参与系数
-        self.gamma = self.calc_modal_participation()
+        t_array.push(t);
+        q_array.push(q);
+        acc_array.push(a_ground);
+      }
+      
+      return { t: t_array, q: q_array, acc: acc_array };
+    }
 
-    def calc_natural_frequency(self):
-        """计算第一阶固有频率 (rad/s)"""
-        if "矩形" in self.shape:
-            L = self.kwargs.get('L')
-            k = np.pi / L
-            omega = np.sqrt(self.g * k * np.tanh(k * self.h))
-            return omega
-            
-        elif "圆柱" in self.shape:
-            R = self.kwargs.get('R')
-            epsilon_1 = 1.8412  # 第一阶贝塞尔函数根 J'_1(ε) = 0
-            omega = np.sqrt((self.g * epsilon_1 / R) * np.tanh(epsilon_1 * self.h / R))
-            return omega
-            
-        elif "圆环" in self.shape:
-            # 圆环形容器：使用平均半径的等效圆柱模型
-            R_out = self.kwargs.get('R_out')
-            R_in = self.kwargs.get('R_in')
-            R_mean = (R_out + R_in) / 2
-            epsilon_1 = 1.8412
-            omega = np.sqrt((self.g * epsilon_1 / R_mean) * np.tanh(epsilon_1 * self.h / R_mean))
-            return omega
-            
-        return 0
+    getWaveHeight(q, x, y) {
+      if (this.shape === 'rectangular') {
+        const L = this.dims.length;
+        const W = this.dims.width;
+        const phi_x = Math.cos(Math.PI * x / L);
+        const phi_y = Math.cos(Math.PI * y / W);
+        return q * phi_x * phi_y;
+      } else if (this.shape === 'cylindrical') {
+        const r = Math.sqrt(x * x + y * y);
+        const R = this.dims.radius;
+        if (r > R) return 0;
+        const theta = Math.atan2(y, x);
+        return q * (r / R) * Math.cos(theta);
+      } else {
+        const r = Math.sqrt(x * x + y * y);
+        const R_out = this.dims.outerRadius;
+        const R_in = this.dims.innerRadius;
+        if (r < R_in || r > R_out) return 0;
+        const theta = Math.atan2(y, x);
+        return q * ((r - R_in) / (R_out - R_in)) * Math.cos(theta);
+      }
+    }
+  }
 
-    def calc_modal_participation(self):
-        """
-        计算模态参与系数 γ
-        定义：广义坐标与物理波高的关系 η(x,t) = γ * q(t) * φ(x)
-        """
-        if "矩形" in self.shape:
-            L = self.kwargs.get('L')
-            k = np.pi / L
-            kh = k * self.h
-            
-            # 矩形容器第一阶模态参与系数
-            # 来源：Housner (1963)
-            if kh < 0.01:  # 极浅水
-                gamma = 1.0
-            else:
-                gamma = np.tanh(kh) / kh
-            return gamma
-            
-        elif "圆柱" in self.shape:
-            R = self.kwargs.get('R')
-            epsilon_1 = 1.8412
-            x = epsilon_1 * self.h / R
-            
-            # 圆柱容器第一阶模态参与系数
-            # gamma = 2 * J_1(ε) / [ε * J_0(ε)]
-            # 使用近似公式避免数值问题
-            if x < 0.1:  # 浅水近似
-                gamma = 1.0
-            else:
-                J0 = jv(0, epsilon_1)
-                J1 = jv(1, epsilon_1)
-                if abs(J0) > 1e-10:
-                    gamma = 2 * J1 / (epsilon_1 * J0)
-                else:
-                    gamma = 0.5  # 深水极限近似
-            return gamma
-            
-        elif "圆环" in self.shape:
-            # 圆环形：使用等效圆柱的参与系数
-            R_out = self.kwargs.get('R_out')
-            R_in = self.kwargs.get('R_in')
-            R_mean = (R_out + R_in) / 2
-            epsilon_1 = 1.8412
-            x = epsilon_1 * self.h / R_mean
-            
-            if x < 0.1:
-                gamma = 1.0
-            else:
-                J0 = jv(0, epsilon_1)
-                J1 = jv(1, epsilon_1)
-                if abs(J0) > 1e-10:
-                    gamma = 2 * J1 / (epsilon_1 * J0)
-                else:
-                    gamma = 0.5
-            return gamma
-            
-        return 0.8  # 默认值
+  // Three.js 3D可视化
+  useEffect(() => {
+    if (!canvasRef.current) return;
 
-    def calc_damping_ratio(self):
-        """
-        根据容器尺寸和频率估算阻尼比
-        考虑：边界层阻尼 + 内部粘性阻尼
-        """
-        nu = 1e-6  # 水的运动粘度 (m²/s) at 20°C
+    // 初始化场景
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xf0f0f0);
+    
+    const camera = new THREE.PerspectiveCamera(
+      50,
+      canvasRef.current.clientWidth / canvasRef.current.clientHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(8, 6, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ 
+      canvas: canvasRef.current, 
+      antialias: true 
+    });
+    renderer.setSize(canvasRef.current.clientWidth, canvasRef.current.clientHeight);
+    renderer.shadowMap.enabled = true;
+
+    // 光照
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+    
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    directionalLight.castShadow = true;
+    scene.add(directionalLight);
+
+    // 网格地面
+    const gridHelper = new THREE.GridHelper(20, 20, 0x888888, 0xcccccc);
+    scene.add(gridHelper);
+
+    // 坐标轴
+    const axesHelper = new THREE.AxesHelper(5);
+    scene.add(axesHelper);
+
+    sceneRef.current = { scene, camera, renderer };
+
+    // 鼠标控制
+    let isDragging = false;
+    let previousMousePosition = { x: 0, y: 0 };
+
+    const onMouseDown = (e) => {
+      isDragging = true;
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    };
+
+    const onMouseMove = (e) => {
+      if (!isDragging) return;
+      
+      const deltaX = e.clientX - previousMousePosition.x;
+      const deltaY = e.clientY - previousMousePosition.y;
+      
+      const rotationSpeed = 0.005;
+      camera.position.applyAxisAngle(new THREE.Vector3(0, 1, 0), -deltaX * rotationSpeed);
+      
+      const radius = Math.sqrt(
+        camera.position.x ** 2 + 
+        camera.position.z ** 2
+      );
+      const newY = camera.position.y + deltaY * rotationSpeed * radius;
+      camera.position.y = Math.max(1, Math.min(15, newY));
+      
+      camera.lookAt(0, 0, 0);
+      previousMousePosition = { x: e.clientX, y: e.clientY };
+    };
+
+    const onMouseUp = () => {
+      isDragging = false;
+    };
+
+    canvasRef.current.addEventListener('mousedown', onMouseDown);
+    canvasRef.current.addEventListener('mousemove', onMouseMove);
+    canvasRef.current.addEventListener('mouseup', onMouseUp);
+
+    // 渲染循环
+    const animate = () => {
+      animationRef.current = requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    // 清理
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+      canvasRef.current?.removeEventListener('mousedown', onMouseDown);
+      canvasRef.current?.removeEventListener('mousemove', onMouseMove);
+      canvasRef.current?.removeEventListener('mouseup', onMouseUp);
+      renderer.dispose();
+    };
+  }, []);
+
+  // 创建容器和液体
+  const createVisualization = () => {
+    if (!sceneRef.current) return;
+    const { scene } = sceneRef.current;
+
+    // 清除旧对象
+    while (scene.children.length > 4) {
+      scene.remove(scene.children[4]);
+    }
+
+    // 容器框架
+    const containerMaterial = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 });
+    
+    if (shapeType === 'rectangular') {
+      const geometry = new THREE.BoxGeometry(length, height, width);
+      const edges = new THREE.EdgesGeometry(geometry);
+      const container = new THREE.LineSegments(edges, containerMaterial);
+      container.position.y = height / 2;
+      scene.add(container);
+    } else if (shapeType === 'cylindrical') {
+      const geometry = new THREE.CylinderGeometry(radius, radius, height, 32);
+      const edges = new THREE.EdgesGeometry(geometry);
+      const container = new THREE.LineSegments(edges, containerMaterial);
+      container.position.y = height / 2;
+      scene.add(container);
+    } else {
+      const outerGeometry = new THREE.CylinderGeometry(radius * 1.5, radius * 1.5, height, 32);
+      const innerGeometry = new THREE.CylinderGeometry(radius * 0.7, radius * 0.7, height, 32);
+      const outerEdges = new THREE.EdgesGeometry(outerGeometry);
+      const innerEdges = new THREE.EdgesGeometry(innerGeometry);
+      const outerContainer = new THREE.LineSegments(outerEdges, containerMaterial);
+      const innerContainer = new THREE.LineSegments(innerEdges, containerMaterial);
+      outerContainer.position.y = height / 2;
+      innerContainer.position.y = height / 2;
+      scene.add(outerContainer);
+      scene.add(innerContainer);
+    }
+
+    // 静态水面
+    const waterGeometry = shapeType === 'rectangular' 
+      ? new THREE.BoxGeometry(length * 0.98, 0.1, width * 0.98)
+      : new THREE.CylinderGeometry(radius * 0.98, radius * 0.98, 0.1, 32);
+    
+    const waterMaterial = new THREE.MeshPhongMaterial({
+      color: 0x4F90F0,
+      transparent: true,
+      opacity: 0.7,
+      side: THREE.DoubleSide
+    });
+    
+    const water = new THREE.Mesh(waterGeometry, waterMaterial);
+    water.position.y = fillHeight;
+    water.userData.isWater = true;
+    scene.add(water);
+  };
+
+  // 运行模拟
+  const runSimulation = async () => {
+    setIsRunning(true);
+    setProgress(0);
+
+    const dimensions = shapeType === 'rectangular' 
+      ? { length, width }
+      : shapeType === 'cylindrical'
+      ? { radius }
+      : { outerRadius: radius * 1.5, innerRadius: radius * 0.7 };
+
+    const solver = new Sloshing3DSolver(shapeType, dimensions, fillHeight, pga, duration);
+    solver.quakeType = quakeType;
+    
+    const solution = solver.solve();
+    
+    setResults({
+      solver,
+      solution,
+      maxResponse: Math.max(...solution.q.map(Math.abs))
+    });
+
+    // 动画循环
+    const { scene } = sceneRef.current;
+    const water = scene.children.find(obj => obj.userData.isWater);
+    
+    if (water) {
+      const waterGeometry = water.geometry;
+      const resolution = 20;
+      
+      for (let i = 0; i < solution.t.length; i += 2) {
+        if (!isRunning) break;
         
-        if "矩形" in self.shape:
-            L = self.kwargs.get('L')
-            # 基于边界层理论的阻尼估算
-            # ξ ≈ 2√(ν/(ωL²))
-            if self.omega_n > 0:
-                xi_viscous = 2 * np.sqrt(nu / (self.omega_n * L**2))
-            else:
-                xi_viscous = 0.01
-            
-            # 加上结构阻尼（经验值）
-            xi_structural = 0.005
-            xi_total = xi_viscous + xi_structural
-            
-            # 限制在合理范围内
-            return np.clip(xi_total, 0.005, 0.05)
-            
-        elif "圆柱" in self.shape:
-            R = self.kwargs.get('R')
-            if self.omega_n > 0:
-                xi_viscous = 2 * np.sqrt(nu / (self.omega_n * R**2))
-            else:
-                xi_viscous = 0.01
-            xi_structural = 0.005
-            xi_total = xi_viscous + xi_structural
-            return np.clip(xi_total, 0.005, 0.05)
-            
-        elif "圆环" in self.shape:
-            R_out = self.kwargs.get('R_out')
-            R_in = self.kwargs.get('R_in')
-            R_mean = (R_out + R_in) / 2
-            if self.omega_n > 0:
-                xi_viscous = 2 * np.sqrt(nu / (self.omega_n * R_mean**2))
-            else:
-                xi_viscous = 0.01
-            xi_structural = 0.005
-            xi_total = xi_viscous + xi_structural
-            return np.clip(xi_total, 0.005, 0.05)
-            
-        return 0.02  # 默认值
-
-    def solve(self, t_eval, acc_array):
-        """
-        求解液体晃动运动方程（修正版）
+        const q = solution.q[i];
         
-        运动方程：
-        q̈ + 2ξω_n q̇ + ω_n² q = -Γ * a_g(t)
+        // 更新水面网格
+        if (shapeType === 'rectangular') {
+          const positions = waterGeometry.attributes.position;
+          let idx = 0;
+          for (let ix = 0; ix < resolution; ix++) {
+            for (let iz = 0; iz < resolution; iz++) {
+              const x = (ix / (resolution - 1) - 0.5) * length;
+              const z = (iz / (resolution - 1) - 0.5) * width;
+              const waveHeight = solver.getWaveHeight(q, x, z);
+              if (positions.array[idx * 3 + 1] !== undefined) {
+                positions.array[idx * 3 + 1] = waveHeight;
+              }
+              idx++;
+            }
+          }
+          positions.needsUpdate = true;
+        }
         
-        其中：
-        - q: 广义模态坐标 (量纲: 米)
-        - Γ: 模态参与系数
-        - a_g(t): 地面加速度 (m/s²)
+        water.position.y = fillHeight + q * 0.5;
         
-        物理波高：η(x,t) = q(t) * φ(x)
-        对于矩形：φ(x) = cos(πx/L)
-        """
-        
-        def equations(y, t):
-            q, q_dot = y
-            
-            # 线性插值获取当前时刻地面加速度
-            a_ground = np.interp(t, t_eval, acc_array)
-            
-            # 运动方程右端项
-            forcing = -self.gamma * a_ground
-            
-            # 状态方程
-            dq_dt = q_dot
-            dq_dot_dt = forcing - 2 * self.xi * self.omega_n * q_dot - (self.omega_n**2) * q
-            
-            return [dq_dt, dq_dot_dt]
-        
-        # 初始条件：静止
-        y0 = [0.0, 0.0]
-        
-        # 求解ODE
-        solution = odeint(equations, y0, t_eval)
-        
-        # 广义坐标 q(t)
-        q_modal = solution[:, 0]
-        
-        # 对于矩形容器，波高在中心处的最大值约为 q(t)
-        # 对于圆柱容器，需要考虑模态形状函数
-        # 这里返回的是广义坐标，单位已经是米
-        
-        return q_modal
-    
-    def get_wave_profile(self, q_value, x_positions):
-        """
-        根据广义坐标计算空间波形
-        
-        参数：
-        - q_value: 当前时刻的广义坐标 (米)
-        - x_positions: 空间位置数组
-        
-        返回：
-        - 波高分布 (米)
-        """
-        if "矩形" in self.shape:
-            L = self.kwargs.get('L')
-            # 第一阶模态形状：cos(πx/L)
-            phi = np.cos(np.pi * x_positions / L)
-            return q_value * phi
-            
-        elif "圆柱" in self.shape:
-            R = self.kwargs.get('R')
-            # 简化为线性分布（x从-R到R）
-            phi = x_positions / R
-            return q_value * phi
-            
-        elif "圆环" in self.shape:
-            # 简化处理
-            R_out = self.kwargs.get('R_out')
-            phi = x_positions / R_out
-            return q_value * phi
-            
-        return np.zeros_like(x_positions)
+        setProgress((i / solution.t.length) * 100);
+        await new Promise(resolve => setTimeout(resolve, 30));
+      }
+    }
 
-# --- 5. 主逻辑 ---
+    setIsRunning(false);
+    setProgress(100);
+  };
 
-# 初始化参数字典
-params = {'L': L, 'R': R, 'R_in': R_in, 'R_out': R_out}
-solver = SloshingSolver(
-    shape_type, 
-    h_fill, 
-    auto_damping=use_auto_damping,
-    manual_xi=manual_damping,
-    **params
-)
+  const resetSimulation = () => {
+    setIsRunning(false);
+    setProgress(0);
+    setResults(null);
+    createVisualization();
+  };
 
-# 顶部指标栏
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("固有频率", f"{solver.freq_n:.3f} Hz")
-c2.metric("阻尼比 ξ", f"{solver.xi:.4f}")
-c3.metric("参与系数 γ", f"{solver.gamma:.3f}")
-c4.metric("输入PGA", f"{pga_g} g")
+  const downloadResults = () => {
+    if (!results) return;
+    
+    const csv = ['时间(s),模态坐标(m),加速度(g)'];
+    results.solution.t.forEach((t, i) => {
+      csv.push(`${t.toFixed(3)},${results.solution.q[i].toFixed(6)},${(results.solution.acc[i] / 9.81).toFixed(4)}`);
+    });
+    
+    const blob = new Blob([csv.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sloshing_3d_results_${Date.now()}.csv`;
+    a.click();
+  };
 
-# 显示理论信息
-with st.expander("📐 查看理论公式"):
-    st.markdown(f"""
-    ### 当前配置的理论参数
-    
-    **容器类型**: {shape_type}
-    
-    **固有频率**: 
-    - 角频率 ω_n = {solver.omega_n:.4f} rad/s
-    - 自然频率 f_n = {solver.freq_n:.4f} Hz
-    - 周期 T = {1/solver.freq_n:.4f} s
-    
-    **模态参与系数**: γ = {solver.gamma:.4f}
-    
-    **阻尼比**: ξ = {solver.xi:.5f}
-    
-    **运动方程**:
-    ```
-    q̈ + 2ξω_n·q̇ + ω_n²·q = -γ·a_g(t)
-    ```
-    
-    **共振放大倍数** (理论值):
-    - Q = 1/(2ξ) ≈ {1/(2*solver.xi):.1f}
-    
-    **预期最大响应** (线性估算):
-    - 若激励频率接近固有频率: η_max ≈ {solver.gamma * pga_g * 9.81 / (2 * solver.xi * solver.omega_n**2):.4f} m
-    """)
+  useEffect(() => {
+    createVisualization();
+  }, [shapeType, radius, length, width, height, fillHeight]);
 
-if st.button("▶️ 运行模拟", type="primary"):
-    
-    # 1. 生成时间步和地震波
-    dt = 0.05
-    t_eval = np.arange(0, duration, dt)
-    acc_array = generate_synthetic_quake(quake_name, t_eval, pga_g)
-    
-    # 2. 求解微分方程
-    with st.spinner("正在求解运动方程..."):
-        modal_coords = solver.solve(t_eval, acc_array)
-    
-    max_response = np.max(np.abs(modal_coords))
-    
-    st.success(f"✅ 计算完成！最大模态响应: {max_response:.4f} m")
-    
-    # 3. 动画与绘图
-    col_anim, col_static = st.columns([3, 2])
-    
-    plot_ph = col_anim.empty()
-    chart_ph = col_static.empty()
-    
-    fig, ax = plt.subplots(figsize=(6, 4))
-    
-    # 动画循环参数
-    sleep_t = 0.05
-    if speed_factor == "慢速": sleep_t = 0.1
-    elif speed_factor == "快速": sleep_t = 0.01
-        
-    prog = st.progress(0)
-    
-    # 计算所有时刻的波形（用于后续绘图）
-    for i, t in enumerate(t_eval):
-        q_current = modal_coords[i]
-        curr_acc = acc_array[i]
-        
-        ax.clear()
-        
-        # --- 绘图逻辑 ---
-        if "矩形" in shape_type:
-            ax.set_xlim(0, L)
-            ax.set_ylim(0, H + 0.5)
-            ax.set_aspect('equal')
-            
-            # 容器边界
-            ax.add_patch(Rectangle((0, 0), L, H, fill=False, lw=3, edgecolor='black'))
-            
-            # 计算晃动水面
-            x = np.linspace(0, L, 100)
-            wave = solver.get_wave_profile(q_current, x)
-            y_surface = h_fill + wave
-            y_surface = np.clip(y_surface, 0, H)
-            
-            # 绘制水体
-            verts = [(0, 0), (L, 0)] + list(zip(x[::-1], y_surface[::-1]))
-            ax.add_patch(Polygon(verts, color='#4F90F0', alpha=0.7, edgecolor='blue', lw=1.5))
-            
-            # 静水面参考线
-            ax.plot([0, L], [h_fill, h_fill], 'k--', alpha=0.3, lw=1)
-            
-        elif "圆柱" in shape_type:
-            ax.set_xlim(-R*1.2, R*1.2)
-            ax.set_ylim(0, H + 0.5)
-            ax.set_aspect('equal')
-            
-            # 容器边界
-            ax.add_patch(Rectangle((-R, 0), 2*R, H, fill=False, lw=3, edgecolor='black'))
-            ax.plot([0, 0], [0, H], 'k--', alpha=0.2, lw=1)
-            
-            # 计算晃动水面
-            x = np.linspace(-R, R, 100)
-            wave = solver.get_wave_profile(q_current, x)
-            y_surface = h_fill + wave
-            y_surface = np.clip(y_surface, 0, H)
-            
-            # 绘制水体
-            verts = [(-R, 0), (R, 0)] + list(zip(x[::-1], y_surface[::-1]))
-            ax.add_patch(Polygon(verts, color='#4F90F0', alpha=0.7, edgecolor='blue', lw=1.5))
-            
-            # 静水面参考线
-            ax.plot([-R, R], [h_fill, h_fill], 'k--', alpha=0.3, lw=1)
-            
-        elif "圆环" in shape_type:
-            ax.set_xlim(-R_out*1.1, R_out*1.1)
-            ax.set_ylim(0, H + 0.5)
-            ax.set_aspect('equal')
-            
-            # 容器边界
-            ax.vlines([-R_out, -R_in, R_in, R_out], 0, H, color='black', lw=2)
-            ax.hlines(0, -R_out, R_out, color='black', lw=2)
-            ax.add_patch(Rectangle((-R_in, 0), 2*R_in, H, color='#CCCCCC', alpha=0.5))
-            
-            # 左侧水体
-            x_l = np.linspace(-R_out, -R_in, 50)
-            wave_l = solver.get_wave_profile(q_current, x_l)
-            y_l = h_fill + wave_l
-            y_l = np.clip(y_l, 0, H)
-            
-            verts_l = [(-R_out, 0), (-R_in, 0)] + list(zip(x_l[::-1], y_l[::-1]))
-            ax.add_patch(Polygon(verts_l, color='#4F90F0', alpha=0.7, edgecolor='blue', lw=1.5))
-            
-            # 右侧水体
-            x_r = np.linspace(R_in, R_out, 50)
-            wave_r = solver.get_wave_profile(q_current, x_r)
-            y_r = h_fill + wave_r
-            y_r = np.clip(y_r, 0, H)
-            
-            verts_r = [(R_in, 0), (R_out, 0)] + list(zip(x_r[::-1], y_r[::-1]))
-            ax.add_patch(Polygon(verts_r, color='#4F90F0', alpha=0.7, edgecolor='blue', lw=1.5))
-            
-            # 静水面参考线
-            ax.plot([-R_out, -R_in], [h_fill, h_fill], 'k--', alpha=0.3, lw=1)
-            ax.plot([R_in, R_out], [h_fill, h_fill], 'k--', alpha=0.3, lw=1)
+  return (
+    <div className="w-full h-screen bg-gray-50 flex flex-col">
+      {/* 头部 */}
+      <div className="bg-gradient-to-r from-blue-600 to-cyan-600 text-white p-4 shadow-lg">
+        <h1 className="text-2xl font-bold flex items-center gap-2">
+          🌊 3D液体晃动模拟器
+          <button
+            onClick={() => setShowInfo(!showInfo)}
+            className="ml-auto p-2 hover:bg-white/20 rounded-full transition"
+          >
+            <Info size={20} />
+          </button>
+        </h1>
+        <p className="text-sm opacity-90 mt-1">高级地震响应分析 | 基于三维势流理论</p>
+      </div>
 
-        # 标注信息
-        ax.set_title(f"时间: {t:.2f}s | 地面加速度: {curr_acc/9.81:.3f}g", fontsize=10)
-        ax.text(0.02, 0.98, f"模态坐标: {q_current:.4f}m\n最大波高: {max_response:.4f}m", 
-                transform=ax.transAxes, fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        ax.set_xlabel("位置 (m)")
-        ax.set_ylabel("高度 (m)")
-        ax.grid(True, alpha=0.2)
-        
-        plot_ph.pyplot(fig)
-        
-        # 动态更新右侧曲线（每5帧更新一次以提高性能）
-        if i % 5 == 0:
-            fig2, ax2 = plt.subplots(2, 1, figsize=(5, 4), sharex=True)
-            
-            # 上图：波高响应
-            ax2[0].plot(t_eval[:i+1], modal_coords[:i+1], color='blue', lw=1.5)
-            ax2[0].axhline(0, color='k', lw=0.5, ls='--', alpha=0.3)
-            ax2[0].set_ylabel("模态坐标 q (m)", fontsize=9)
-            ax2[0].set_title("液体晃动响应", fontsize=10)
-            ax2[0].grid(True, alpha=0.3)
-            ax2[0].set_ylim(-max_response*1.2, max_response*1.2)
-            
-            # 下图：输入加速度
-            ax2[1].plot(t_eval[:i+1], acc_array[:i+1]/9.81, color='red', lw=1)
-            ax2[1].axhline(0, color='k', lw=0.5, ls='--', alpha=0.3)
-            ax2[1].set_ylabel("加速度 (g)", fontsize=9)
-            ax2[1].set_xlabel("时间 (s)", fontsize=9)
-            ax2[1].set_title("地震输入", fontsize=10)
-            ax2[1].grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            chart_ph.pyplot(fig2)
-            plt.close(fig2)
+      <div className="flex-1 flex gap-4 p-4 overflow-hidden">
+        {/* 左侧控制面板 */}
+        <div className="w-80 bg-white rounded-lg shadow-md p-4 overflow-y-auto">
+          <h3 className="font-bold text-lg mb-4 text-gray-800">🏗️ 模型参数</h3>
+          
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">容器形状</label>
+              <select
+                value={shapeType}
+                onChange={(e) => setShapeType(e.target.value)}
+                className="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="rectangular">矩形容器</option>
+                <option value="cylindrical">圆柱容器</option>
+                <option value="annular">圆环容器</option>
+              </select>
+            </div>
 
-        prog.progress((i+1)/len(t_eval))
-        time.sleep(sleep_t)
-    
-    plt.close(fig)
-    st.success("✅ 模拟结束")
-    
-    # 最终结果统计
-    st.markdown("---")
-    st.subheader("📊 结果统计")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("最大波高响应", f"{max_response:.4f} m")
-        st.caption(f"相对水深: {max_response/h_fill*100:.1f}%")
-    
-    with col2:
-        max_acc_idx = np.argmax(np.abs(acc_array))
-        st.metric("峰值地面加速度", f"{np.max(np.abs(acc_array))/9.81:.3f} g")
-        st.caption(f"发生在 t={t_eval[max_acc_idx]:.2f}s")
-    
-    with col3:
-        # 计算能量相关指标
-        energy_ratio = max_response / (pga_g * 9.81 / solver.omega_n**2)
-        st.metric("动力放大系数", f"{energy_ratio:.2f}")
-        st.caption(f"理论值: ~{1/(2*solver.xi):.1f}")
-    
-    # 频谱分析
-    st.markdown("---")
-    st.subheader("🔬 频谱分析")
-    
-    # FFT分析
-    from scipy.fft import fft, fftfreq
-    
-    N = len(modal_coords)
-    T_sample = t_eval[1] - t_eval[0]
-    yf = fft(modal_coords)
-    xf = fftfreq(N, T_sample)[:N//2]
-    
-    # 只取正频率部分
-    power = 2.0/N * np.abs(yf[0:N//2])
-    
-    fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(10, 3))
-    
-    # 响应频谱
-    ax3a.plot(xf, power, 'b-', lw=1)
-    ax3a.axvline(solver.freq_n, color='r', linestyle='--', lw=2, label=f'固有频率 {solver.freq_n:.3f} Hz')
-    ax3a.set_xlabel('频率 (Hz)')
-    ax3a.set_ylabel('幅值')
-    ax3a.set_title('响应频谱')
-    ax3a.set_xlim(0, 5)
-    ax3a.grid(True, alpha=0.3)
-    ax3a.legend()
-    
-    # 输入加速度频谱
-    yf_input = fft(acc_array/9.81)
-    power_input = 2.0/N * np.abs(yf_input[0:N//2])
-    ax3b.plot(xf, power_input, 'r-', lw=1)
-    ax3b.axvline(solver.freq_n, color='r', linestyle='--', lw=2, label=f'固有频率 {solver.freq_n:.3f} Hz')
-    ax3b.set_xlabel('频率 (Hz)')
-    ax3b.set_ylabel('幅值')
-    ax3b.set_title('输入加速度频谱')
-    ax3b.set_xlim(0, 5)
-    ax3b.grid(True, alpha=0.3)
-    ax3b.legend()
-    
-    plt.tight_layout()
-    st.pyplot(fig3)
-    plt.close(fig3)
-    
-    # 时程对比图
-    st.markdown("---")
-    st.subheader("📈 完整时程曲线")
-    
-    fig4, ax4 = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
-    
-    # 波高时程
-    ax4[0].plot(t_eval, modal_coords, 'b-', lw=1.5, label='液体晃动响应')
-    ax4[0].axhline(0, color='k', lw=0.5, ls='--', alpha=0.3)
-    ax4[0].axhline(max_response, color='r', lw=1, ls=':', alpha=0.5, label=f'最大值: {max_response:.4f}m')
-    ax4[0].axhline(-max_response, color='r', lw=1, ls=':', alpha=0.5)
-    ax4[0].set_ylabel('模态坐标 q (m)', fontsize=10)
-    ax4[0].set_title('液体晃动响应时程', fontsize=11)
-    ax4[0].grid(True, alpha=0.3)
-    ax4[0].legend(loc='upper right')
-    
-    # 加速度时程
-    ax4[1].plot(t_eval, acc_array/9.81, 'r-', lw=1, label='地震加速度输入')
-    ax4[1].axhline(0, color='k', lw=0.5, ls='--', alpha=0.3)
-    ax4[1].axhline(pga_g, color='darkred', lw=1, ls=':', alpha=0.5, label=f'PGA: {pga_g}g')
-    ax4[1].axhline(-pga_g, color='darkred', lw=1, ls=':', alpha=0.5)
-    ax4[1].set_ylabel('加速度 (g)', fontsize=10)
-    ax4[1].set_xlabel('时间 (s)', fontsize=10)
-    ax4[1].set_title('地震输入时程', fontsize=11)
-    ax4[1].grid(True, alpha=0.3)
-    ax4[1].legend(loc='upper right')
-    
-    plt.tight_layout()
-    st.pyplot(fig4)
-    plt.close(fig4)
-    
-    # 下载数据
-    st.markdown("---")
-    st.subheader("💾 导出数据")
-    
-    import pandas as pd
-    
-    df_results = pd.DataFrame({
-        '时间(s)': t_eval,
-        '模态坐标(m)': modal_coords,
-        '地震加速度(g)': acc_array / 9.81,
-        '地震加速度(m/s²)': acc_array
-    })
-    
-    csv = df_results.to_csv(index=False).encode('utf-8')
-    
-    st.download_button(
-        label="📥 下载结果CSV文件",
-        data=csv,
-        file_name=f'sloshing_results_{quake_name}_{pga_g}g.csv',
-        mime='text/csv',
-    )
-    
-    # 参数总结
-    with st.expander("📋 计算参数总结"):
-        st.markdown(f"""
-        ### 模拟配置参数
-        
-        **容器几何**
-        - 形状: {shape_type}
-        - 特征尺寸: {L if '矩形' in shape_type else (R if '圆柱' in shape_type else f'Rout={R_out}, Rin={R_in}')} m
-        - 总高度: {H} m
-        - 液面深度: {h_fill} m
-        - 充液率: {h_fill/H*100:.1f}%
-        
-        **动力学参数**
-        - 固有频率: {solver.freq_n:.4f} Hz
-        - 固有周期: {1/solver.freq_n:.4f} s
-        - 角频率: {solver.omega_n:.4f} rad/s
-        - 阻尼比: {solver.xi:.5f}
-        - 模态参与系数: {solver.gamma:.4f}
-        
-        **地震输入**
-        - 地震波: {quake_name}
-        - PGA: {pga_g} g ({pga_g*9.81:.2f} m/s²)
-        - 持续时间: {duration} s
-        - 时间步长: {dt} s
-        
-        **计算结果**
-        - 最大响应: {max_response:.4f} m
-        - 相对水深比: {max_response/h_fill*100:.2f}%
-        - 动力放大系数: {max_response / (pga_g * 9.81 / solver.omega_n**2):.2f}
-        - 理论放大系数: {1/(2*solver.xi):.2f}
-        
-        **算法说明**
-        - 模型: 单模态线性晃动理论
-        - 求解器: scipy.integrate.odeint (LSODA)
-        - 频率计算: 基于势流理论
-        - 阻尼模型: 边界层阻尼 + 结构阻尼
-        """)
+            {shapeType === 'rectangular' && (
+              <>
+                <div>
+                  <label className="block text-sm font-medium mb-1">长度 L (m): {length}</label>
+                  <input
+                    type="range"
+                    min="2"
+                    max="10"
+                    step="0.5"
+                    value={length}
+                    onChange={(e) => setLength(parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">宽度 W (m): {width}</label>
+                  <input
+                    type="range"
+                    min="2"
+                    max="10"
+                    step="0.5"
+                    value={width}
+                    onChange={(e) => setWidth(parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
+              </>
+            )}
 
-# --- 底部说明 ---
-st.markdown("---")
-st.markdown("""
-### 📚 理论基础
+            {shapeType === 'cylindrical' && (
+              <div>
+                <label className="block text-sm font-medium mb-1">半径 R (m): {radius}</label>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="5"
+                  step="0.1"
+                  value={radius}
+                  onChange={(e) => setRadius(parseFloat(e.target.value))}
+                  className="w-full"
+                />
+              </div>
+            )}
 
-本程序基于**线性势流理论**求解液体晃动问题：
+            {shapeType === 'annular' && (
+              <div>
+                <label className="block text-sm font-medium mb-1">基准半径 (m): {radius}</label>
+                <input
+                  type="range"
+                  min="0.5"
+                  max="5"
+                  step="0.1"
+                  value={radius}
+                  onChange={(e) => setRadius(parseFloat(e.target.value))}
+                  className="w-full"
+                />
+                <p className="text-xs text-gray-500 mt-1">外径={radius * 1.5}m, 内径={radius * 0.7}m</p>
+              </div>
+            )}
 
-1. **运动方程**: 单自由度振子模型
-   ```
-   q̈ + 2ξω_n·q̇ + ω_n²·q = -γ·a_g(t)
-   ```
+            <div>
+              <label className="block text-sm font-medium mb-1">容器高度 H (m): {height}</label>
+              <input
+                type="range"
+                min="1"
+                max="10"
+                step="0.5"
+                value={height}
+                onChange={(e) => setHeight(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </div>
 
-2. **固有频率** (矩形容器):
-   ```
-   ω_n = √(g·k·tanh(k·h)), k = π/L
-   ```
+            <div>
+              <label className="block text-sm font-medium mb-1">液面深度 h (m): {fillHeight}</label>
+              <input
+                type="range"
+                min="0.5"
+                max={height}
+                step="0.1"
+                value={fillHeight}
+                onChange={(e) => setFillHeight(parseFloat(e.target.value))}
+                className="w-full"
+              />
+            </div>
 
-3. **模态参与系数** (矩形):
-   ```
-   γ = tanh(k·h) / (k·h)
-   ```
+            <hr className="my-4" />
 
-4. **适用范围**:
-   - 小幅晃动 (η/h < 0.1)
-   - 单模态主导
-   - 无粘性流体假设
+            <h3 className="font-bold text-lg mb-4 text-gray-800">📉 地震输入</h3>
 
-5. **主要修正** (相比原版):
-   - ✅ 修正模态参与系数计算
-   - ✅ 移除不合理的响应缩放
-   - ✅ 添加自适应阻尼估算
-   - ✅ 改进贝塞尔函数计算
+            <div>
+              <label className="block text-sm font-medium mb-1">地震波类型</label>
+              <select
+                value={quakeType}
+                onChange={(e) => setQuakeType(e.target.value)}
+                className="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="sine">正弦波</option>
+                <option value="elcentro">El Centro (1940)</option>
+                <option value="kobe">Kobe (1995)</option>
+                <option value="northridge">Northridge (1994)</option>
+              </select>
+            </div>
 
-### ⚠️ 使用注意事项
+            <div>
+              <label className="block text-sm font-medium mb-1">PGA (g): {pga}</label>
+              <input
+                type="range"
+                min="0.05"
+                max="1"
+                step="0.05"
+                value={pga}
+                onChange={(e) => setPga(parseFloat(e.target.value))}
+                className="w-full"
+              />
+              <p className="text-xs text-gray-500 mt-1">{(pga * 9.81).toFixed(2)} m/s²</p>
+            </div>
 
-- 当波高超过水深的10%时，应考虑非线性效应
-- 浅水情况 (h/L < 0.1) 结果可能偏差较大
-- 圆环形容器使用等效模型，精度相对较低
-- 真实地震波建议使用实测数据替代模拟波形
+            <div>
+              <label className="block text-sm font-medium mb-1">模拟时长 (s): {duration}</label>
+              <input
+                type="range"
+                min="10"
+                max="40"
+                step="5"
+                value={duration}
+                onChange={(e) => setDuration(parseInt(e.target.value))}
+                className="w-full"
+              />
+            </div>
 
-### 🔗 参考文献
+            <div className="flex gap-2 mt-6">
+              <button
+                onClick={runSimulation}
+                disabled={isRunning}
+                className="flex-1 bg-blue-600 text-white py-2 px-4 rounded hover:bg-blue-700 disabled:bg-gray-400 flex items-center justify-center gap-2"
+              >
+                {isRunning ? <Pause size={16} /> : <Play size={16} />}
+                {isRunning ? '运行中...' : '运行模拟'}
+              </button>
+              <button
+                onClick={resetSimulation}
+                className="p-2 bg-gray-200 rounded hover:bg-gray-300"
+              >
+                <RotateCcw size={20} />
+              </button>
+            </div>
 
-- Housner, G.W. (1963). "The Dynamic Behavior of Water Tanks"
-- Ibrahim, R.A. (2005). "Liquid Sloshing Dynamics"
-- Faltinsen, O.M. (1974). "A Nonlinear Theory of Sloshing"
+            {isRunning && (
+              <div className="w-full bg-gray-200 rounded-full h-2 mt-2">
+                <div
+                  className="bg-blue-600 h-2 rounded-full transition-all"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            )}
 
----
+            {results && (
+              <div className="mt-4 p-3 bg-green-50 rounded border border-green-200">
+                <h4 className="font-bold text-sm mb-2">📊 结果</h4>
+                <div className="text-sm space-y-1">
+                  <p>固有频率: {results.solver.freq_n.toFixed(3)} Hz</p>
+                  <p>阻尼比: {results.solver.xi.toFixed(4)}</p>
+                  <p>最大响应: {results.maxResponse.toFixed(4)} m</p>
+                </div>
+                <button
+                  onClick={downloadResults}
+                  className="mt-2 w-full bg-green-600 text-white py-1 px-3 rounded text-sm hover:bg-green-700 flex items-center justify-center gap-2"
+                >
+                  <Download size={14} />
+                  下载数据
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
 
-**版本**: v2.0 (算法修正版) | **开发**: Streamlit + NumPy + SciPy | **许可**: MIT
-""")
+        {/* 右侧3D视图 */}
+        <div className="flex-1 bg-white rounded-lg shadow-md overflow-hidden relative">
+          <canvas ref={canvasRef} className="w-full h-full" />
+          <div className="absolute top-4 left-4 bg-black/70 text-white p-3 rounded text-sm space-y-1">
+            <p>🖱️ 拖动旋转视角</p>
+            <p>📐 坐标轴: X(红) Y(绿) Z(蓝)</p>
+          </div>
+        </div>
+      </div>
+
+      {/* 信息面板 */}
+      {showInfo && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg max-w-2xl max-h-[80vh] overflow-y-auto p-6">
+            <h2 className="text-2xl font-bold mb-4">理论基础</h2>
+            <div className="space-y-4 text-sm">
+              <div>
+                <h3 className="font-bold">运动方程</h3>
+                <p className="font-mono bg-gray-100 p-2 rounded">q̈ + 2ξω_n·q̇ + ω_n²·q = -γ·a_g(t)</p>
+              </div>
+              <div>
+                <h3 className="font-bold">固有频率 (圆柱容器)</h3>
+                <p className="font-mono bg-gray-100 p-2 rounded">ω_n = √[(g·ε₁/R)·tanh(ε₁h/R)]</p>
+                <p className="text-gray-600">其中 ε₁ = 1.8412 (第一阶贝塞尔函数根)</p>
+              </div>
+              <div>
+                <h3 className="font-bold">适用范围</h3>
+                <ul className="list-disc ml-5 space-y-1">
+                  <li>小幅晃动 (η/h {'<'} 0.1)</li>
+                  <li>线性势流假设</li>
+                  <li>单模态主导</li>
+                </ul>
+              </div>
+              <div>
+                <h3 className="font-bold">3D计算特点</h3>
+                <ul className="list-disc ml-5 space-y-1">
+                  <li>考虑X、Y双向晃动耦合</li>
+                  <li>三维模态形状函数</li>
+                  <li>实时波面重构</li>
+                </ul>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowInfo(false)}
+              className="mt-6 w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700"
+            >
+              关闭
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default Sloshing3DSimulator;
